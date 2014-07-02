@@ -1,0 +1,330 @@
+#!/usr/bin/perl -w
+use strict;
+use File::Find      qw(find);
+use Getopt::Long    qw(GetOptions);
+use List::Util      qw(sum);
+use Proc::Daemon    qw();
+use Sys::Syslog     qw(openlog syslog);
+use Time::HiRes     qw(sleep);
+use Linux::Inotify2;
+
+$| = 1;
+
+GetOptions(
+    "from=s"                => \my $from,
+    "to=s"                  => \my @to,
+    "debug"                 => \my $debug,
+    "daemon"                => \my $daemon,
+    "syslog"                => \my $syslog,
+    "pidfile=s"             => \my $pidfile,
+    "dry"                   => \my $dry,
+    "delete"                => \my $delete,
+    "quiet"                 => \my $quiet,
+    "ignore=s"              => \my @ignore,
+    "ignore-temp"           => \my $ignore_temp,
+    "ignore-dotfiles"       => \my $ignore_dotfiles,
+    "ignore-backups"        => \my $ignore_backups,
+    "ignore-logs"           => \my $ignore_logs,
+    "rsync-exclude=s"       => \my @rsync_exclude,
+    "interval=f"            => \(my $interval = 1),
+    "full-sync-threshold=i" => \(my $threshold = 10),
+) or die "Huh?\n";
+
+$syslog = 1 if $daemon;
+
+if ($syslog) {
+    openlog $0, "nofatal,pid", "daemon";
+    syslog info => "Started.";
+    END { syslog info => "Stopped."; }
+
+    $SIG{__WARN__} = sub { syslog debug => shift };
+}
+
+BEGIN {
+    *CORE::GLOBAL::die = sub {
+        die shift if not $syslog;
+        syslog crit => shift;
+        exit 255;
+    };
+}
+
+sub debug {
+    return if not $debug;
+
+    if ($syslog) {
+        syslog warning => shift;
+    } else {
+        warn shift;
+    }
+}
+
+sub info {
+    return if $quiet;
+
+    if ($syslog) {
+        syslog info => shift;
+    } else {
+        print shift;
+    }
+}
+
+my $care = IN_CLOSE_WRITE | IN_MOVE | IN_DELETE | IN_ATTRIB | IN_CREATE;
+my $mask = $care;
+
+
+$from // die "Source path (--from) is mandatory.\n";
+@to   or warn "No --to given; debug output only.\n";
+@to   or $debug = 1;
+@ARGV and die "Too many arguments: @ARGV\n";
+
+if ($debug and $quiet) {
+    warn "--debug overrides --quiet.\n";
+    $quiet = 0;
+}
+
+if ($daemon) {
+    $from    !~ m[^/] and die "Source path must be absolute with --daemon.\n";
+
+    $pidfile !~ m[^/] and die "PID File path must be absolute.\n"
+        if defined $pidfile;
+
+    grep { ! m[^/ | :]x } @to
+        and die "Destination paths must be absolute with --daemon.\n";
+
+    Proc::Daemon::Init({ pid_file => $pidfile });
+
+    $SIG{TERM} = sub { exit };
+} else {
+    $pidfile and die "PID file not supported without --daemon.\n";
+}
+
+if ($ignore_temp) {
+    push @ignore, '\.te?mp$', '^\..*\bte?mp\b', '[._].*\.swp$', '^#.+#$#';
+}
+if ($ignore_dotfiles) {
+    push @ignore, '^\.';
+}
+if ($ignore_backups) {
+    push @ignore, '\.(?:bak|backup|old|orig)$', '~$';
+}
+if ($ignore_logs) {
+    push @ignore, '[._-]log$', '/logs?/';
+}
+
+s[/+$][] for $from, @to;  # remove trailing slashes
+
+-d $from or die "$from is not a directory\n";
+
+
+
+my $inotify = new Linux::Inotify2 or die $!;
+$inotify->blocking(0);
+
+my $watching = 0;
+my %watching;
+sub watch {
+    my ($path) = @_;
+
+    find({
+        no_chdir => 1,
+        wanted => sub {
+            -d or return;
+
+            if (is_ignored($_)) {
+                debug "Not watching $_: ignored.";
+                return;
+            }
+            debug "Creating watch on $_";
+
+            if (my $w = $inotify->watch($_, $mask)) {
+                # Create hash tree as a side-effect of autovivification
+                my $node = \%watching;
+                $node = \%{ $node->{$_} } for split m[/+], $_;
+
+                # Using \0 for special cases; \0 is invalid in filenames anyway
+                $node->{"\0"} = $w;
+                $watching++;
+            } else {
+                warn "Could not create watch on $_";
+            }
+        },
+    }, $path);
+    debug "Watching $watching objects.";
+}
+
+sub unwatch {
+    my ($path) = @_;
+
+    my $node = \%watching;
+    if (ref $path) {
+        # Not a path, but a hash (subtree of %watching)
+        debug "Un-watching " . $path->{"\0"}->name
+            if exists $path->{"\0"};
+        $node = $path;
+    } else {
+        debug "Un-watching $path";
+        $node = \%{ $node->{$_} } for split m[/+], $path;
+    }
+
+    for (keys %$node) {
+        unwatch($node->{$_}) if $_ ne "\0";
+        $node->{$_}->cancel  if $_ eq "\0";
+    }
+
+    $watching-- if exists $node->{"\0"};
+    delete $node->{"\0"};
+    debug "Watching $watching objects.";
+}
+
+sub sync {
+    my @have_recursed;
+
+    ITEM: for my $item (sort { $a->{path} cmp $b->{path} } @_) {
+        my $path = $item->{path};
+        for (@have_recursed) {
+            if ($path =~ m[^ \Q$_\E (?: / | $ )]x) {
+                debug "Skipping $path because $_ was already recursed.";
+                next ITEM;
+            }
+        }
+        if (not -e $item->{path}) {
+            debug "Skipping $path because it is already gone.";
+            next ITEM;
+        }
+        if ($item->{recurse}) {
+            push @have_recursed, $path;
+        }
+        (my $subpath = $path) =~ s[^ \Q$from\E /? ][]x;
+        my @subpath = split m[/+], $subpath;
+        for my $to (@to) {
+            my $to_full   = join "/", $to, @subpath[0 .. $#subpath];
+            my $to_parent = join "/", $to, @subpath[0 .. $#subpath - 1];
+            my @command = (
+                "rsync",
+                "-lptgoD",  # -a without -r
+                ($debug ? "-v" : ()),
+                (map {; "--exclude" => $_ } @rsync_exclude),
+                ($item->{delete} && $delete ? "--delete" : ()),
+                ($item->{recurse}
+                    ? ("-r", "--", "$path/" => "$to_full/")
+                    : (      "--", "$path"  => "$to_parent")
+                )
+            );
+            my $action = $dry ? "Not running (dry run)" : "Running";
+            info "$action: @command";
+            print "\e[30;1m" if $debug and not $syslog;
+            system(@command) == 0 or warn "rsync returned $?\n";
+            print "\e[0m" if $debug and not $syslog;
+        }
+    }
+}
+
+sub is_ignored {
+    my ($path) = @_;
+    for (@ignore) {
+        my $re = $_;
+        $re =~ s[\^][(?:^|(?<=/))];
+        return 1 if $path =~ /$re/;
+    }
+    return 0;
+}
+
+watch $from;
+$watching or die "Couldn't create any watcher; bailing out.\n";
+info "Watching $watching directories.";
+
+sync {
+    recurse => 1,
+    path => $from,
+    delete => $delete,
+};
+
+while () {
+    my @events;
+
+    # Fetch events until $interval has passed without any events
+    while (my @e = $inotify->read) {
+        debug( (@events ? "Even more" : "Something") . " happened!" );
+        push @events, @e;
+        push @events, @e while @e = $inotify->read;  # slurp
+        sleep $interval;
+    }
+    sleep $interval if not @events;
+
+    my %todo;
+    my $watches_changed = 0;
+
+    for (@events) {
+        my $fn = $_->fullname;
+        if (is_ignored($fn)) {
+            debug "Skipping event for $fn: ignored.";
+            next;
+        }
+
+        my $mkdir = ($_->IN_ISDIR and ($_->IN_CREATE or $_->IN_MOVED_TO));
+
+        my $interesting = $_->mask & $care;
+        $mkdir or $interesting or next;
+        debug "Something interesting happened to $fn";
+
+        my $node = \%todo;
+        if ($delete or not $_->IN_DELETE) {
+            $node = \%{ $node->{$_} } for split m[/+], $fn;
+        }
+
+        if ($mkdir) {
+            debug "New directory, creating watch for $fn";
+            watch $fn;
+            $node->{"\0"} = IN_CREATE;
+            $watches_changed = 1;
+        } elsif ($_->IN_DELETE or $_->IN_MOVED_FROM) {
+            debug "R.I.P. $fn";
+            $node->{"\0"} = IN_DELETE if $delete;
+            # Need to unwatch moved_from because its ->name is no longer
+            # correct.
+            unwatch($fn) if $_->IN_ISDIR;
+            $watches_changed = 1;
+        }
+    }
+    %todo or next;
+
+    my @sync;
+
+    my $walk;
+    $walk = sub {
+        my ($path, $hash) = @_;
+        my @keys = keys %$hash;
+        if (@keys == 0) {
+            # Nothing happened inside, just sync the leaf
+            push @sync, { recurse => 0, path => join "/", @$path };
+        } elsif (exists $hash->{"\0"}) {
+            if ($hash->{"\0"} == IN_DELETE) {
+                # Deleted, so rsync parent directory
+                push @sync, {
+                    recurse => 1,
+                    delete => 1,
+                    path => join "/", @$path[ 0 .. $#$path - 1 ],
+                };
+            } elsif ($hash->{"\0"} == IN_CREATE) {
+                # New directory, may contain undeclared children, so recurse
+                push @sync, { recurse => 1, path => join "/", @$path };
+            }
+        } elsif (@keys >= $threshold) {
+            # Too much happened inside, rsync directory recursively
+            push @sync, { recurse => 1, path => join "/", @$path };
+        } else {
+            # Deeper down the rabbit hole
+            $walk->([ @$path, $_ ], $hash->{ $_ }) for @keys;
+        }
+    };
+    $walk->([], \%todo);
+
+    info "Watching $watching directories." if $watches_changed;
+
+    sync @sync if @sync;
+}
+
+
+# XXX TODO
+# - documentatie
+# - checken of opgegeven paden symlinks zijn
