@@ -64,7 +64,7 @@ sub info {
     if ($syslog) {
         syslog info => shift;
     } else {
-        print shift;
+        print shift, "\n";
     }
 }
 
@@ -328,3 +328,4 @@ while () {
 # XXX TODO
 # - documentatie
 # - checken of opgegeven paden symlinks zijn
+# - foutafhandeling (queue overflow => rescan)
